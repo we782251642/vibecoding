@@ -37,7 +37,7 @@ const selectedTask = computed(() => tasks.value.find((task) => task.id === selec
 const doneCount = computed(() => tasks.value.filter((task) => task.done).length)
 
 function selectMode(id) {
-  mode.value = id
+  mode.value = id 
   running.value = false
   remaining.value = durations.value[id] * 60
 }
