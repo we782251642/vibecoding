@@ -1,49 +1,76 @@
-/**
- * 媒体批量下载脚本（Node.js 20+，无需安装依赖）
- *
- * 在命令行进入此脚本所在目录，然后运行：
- *   node ./download-media.mjs "JSON文件路径" "输出目录"
- * 启动后输入数字并回车：1 = 仅图片，2 = 仅视频，3 = 图片和视频。
- * 必须明确选择；输入无效时重新提示，Ctrl+C 可取消。
- * 例如：
- *   node ./download-media.mjs "C:/Users/MoWen/Downloads/bookmark-gallery-likes-2026-11-11 (1).json" "./downloaded-media"
- * 只检查数据、不访问任何链接：
- *   node ./download-media.mjs "JSON文件路径" --dry-run
- * 仅重试输出目录同一输入文件最新报告中的失败项（仍可选择图片/视频）：
- *   node ./download-media.mjs "JSON文件路径" "输出目录" --retry-failed
- * 默认使用下方 PROXY_URL 常量指定的代理，无需在命令中输入代理参数。
- * 修改 PROXY_URL 可更换地址，设为 '' 可关闭脚本自动启用代理。
- * 代理需要支持 --use-env-proxy 的 Node.js，如本机 v22.22.2。
- * 仍可通过 --proxy http://127.0.0.1:7890 临时覆盖常量；--dry-run 不建立网络连接。
- *
- * 输出目录可省略，默认使用当前工作目录下的 downloaded-media。
- * 从 posts[].media[] 下载 photo 的 url 和 video 的 videoUrl。
- * 文件名：作者名称_帖子名称_帖子ID_帖子序号_媒体序号_类型.扩展名
- * 作者优先使用 author.name，其次 author.handle；帖子优先使用 name，
- * 没有 name 时使用 text（去除链接）的前 48 个 UTF-16 单元。
- * 缺少名称时使用“未知作者”或“无标题”，非法文件名字符会替换为下划线。
- * 作者名称最多 32 个 UTF-16 单元，保留帖子和媒体序号以防重名。
- *
- * 下载时显示速度、大小、文件数量和预计剩余时间；大小未知时会明确标注。
- * 最多同时下载 4 个文件，每个文件最多尝试 3 次。
- * 完成后保存 download-report_年月日_时分秒_毫秒_唯一标识.json，保留历史报告。
- * 文件名时间使用北京时间（Asia/Shanghai）；仍兼容旧版 download-report.json。
- * 重复运行时，用本地 SHA-256 记录及服务器已知大小验证已有文件，验证通过则跳过。
- * 无校验记录或文件损坏时重新下载；download-state.json 保存校验记录，请保留。
- * 下载后检查非空、响应声明大小和传输完整性，再将临时文件改为正式文件。
- * 服务器未提供大小时只能验证传输正常结束，不能证明源文件内容完整。
- */
+// 使用说明见同目录 readme.md。
+// # 可配置常量（集中配置区）
+// ## 1. 输出与网络
+// 下载根目录：相对路径基于脚本所在文件夹；也可填写绝对路径。
+const OUTPUT_DIRECTORY = 'XD';
+// 默认 HTTP(S) 代理地址；空字符串 '' 关闭自动代理，--proxy 可临时覆盖。
+const PROXY_URL = 'http://127.0.0.1:7890';
+// 同时处理的文件数：正整数，过大会增加网络、磁盘和服务器压力。
+const DOWNLOAD_CONCURRENCY = 4;
+// 每次下载的完整超时时间，单位毫秒，必须大于 0（默认 5 分钟）。
+const DOWNLOAD_TIMEOUT_MS = 300_000;
+// 每个文件最多尝试次数（包含首次下载），正整数。
+const DOWNLOAD_MAX_ATTEMPTS = 3;
+// 下载重试基础等待时间，单位毫秒；实际等待 = 此值 × 已尝试次数。
+const DOWNLOAD_RETRY_DELAY_MS = 1000;
+
+// ## 2. 文件命名与日志
+// 作者及帖子标题的长度上限，单位 UTF-16 单元，均为正整数。
+// 调整后会影响新文件命名；过长可能超过系统路径限制。
+const AUTHOR_NAME_MAX_LENGTH = 32;
+const POST_NAME_MAX_LENGTH = 48;
+// 帖子发表时间的时区；日期格式为 YYYY-MM-DD_HHmmss。
+const POST_DATE_TIME_ZONE = 'Asia/Shanghai';
+// 日志文件名的时区，使用有效 IANA 时区名称。
+const REPORT_TIME_ZONE = 'Asia/Shanghai';
+
+// ## 3. 进度显示
+// 终端进度刷新间隔，单位毫秒，必须大于 0。
+const PROGRESS_REFRESH_MS = 500;
+// 输出重定向到日志时，每隔多少次刷新打印一行，正整数（默认约 5 秒）。
+const LOG_PROGRESS_EVERY_TICKS = 10;
+// 配置区结束
+
 import { readFile, mkdir, writeFile, rename, rm, stat, readdir } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Readable, Transform } from 'node:stream';
 import { clearLine, cursorTo, createInterface } from 'node:readline';
 import { pipeline } from 'node:stream/promises';
 import { createWriteStream, createReadStream } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { setTimeout as delay } from 'node:timers/promises';
 
-// 默认代理地址：修改此常量即可；设为 '' 可关闭脚本自动启用代理。
-const PROXY_URL = 'http://127.0.0.1:7890';
+// 根据脚本位置自动计算，无需配置。
+const SCRIPT_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
+
+async function writeJsonAtomic(filename, value, operations = {}) {
+  const io = { writeFile, rename, rm, delay, ...operations };
+  const temporary = `${filename}.${randomUUID()}.tmp`;
+  try {
+    await io.writeFile(temporary, JSON.stringify(value, null, 2), 'utf8');
+    for (let attempt = 0; ; attempt++) {
+      try { await io.rename(temporary, filename); return; }
+      catch (error) {
+        if (!['EPERM', 'EBUSY', 'EACCES'].includes(error.code) || attempt >= 4) throw error;
+        await io.delay(100 * 2 ** attempt);
+      }
+    }
+  } finally {
+    await io.rm(temporary, { force: true }).catch(() => {});
+  }
+}
+
+// 一次保存失败后，后续保存仍然可以继续执行。
+function createSaveQueue() {
+  let queue = Promise.resolve();
+  return operation => {
+    const result = queue.then(operation);
+    queue = result.catch(() => {});
+    return result;
+  };
+}
 
 // Node.js 20+，无需安装依赖。
 const args = process.argv.slice(2);
@@ -63,8 +90,8 @@ const dryRun = args.includes('--dry-run');
 const retryFailed = args.includes('--retry-failed');
 const positional = args.filter(arg => !['--dry-run', '--retry-failed'].includes(arg));
 const proxy = explicitProxy ?? PROXY_URL;
-if (!positional[0] || positional.length > 2) {
-  console.log('用法：node download-media.mjs <JSON文件> [输出目录] [--retry-failed] [--proxy http://127.0.0.1:7890] [--dry-run]');
+if (!positional[0] || positional.length !== 1) {
+  console.log('用法：node download-media.mjs <JSON文件> [--retry-failed] [--proxy http://127.0.0.1:7890] [--dry-run]');
   process.exitCode = 1;
 } else if (!dryRun && proxy && !process.execArgv.includes('--use-env-proxy')) {
   if (!process.allowedNodeEnvironmentFlags.has('--use-env-proxy')) {
@@ -86,27 +113,74 @@ if (!positional[0] || positional.length > 2) {
 }
 
 async function main() {
+  const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  try { await run(input[Symbol.asyncIterator]()); }
+  finally { input.close(); }
+}
+
+async function run(inputLines) {
   const input = path.resolve(positional[0]);
-  const output = path.resolve(positional[1] ?? 'downloaded-media');
-  const data = JSON.parse((await readFile(input, 'utf8')).replace(/^\uFEFF/, ''));
+  const output = path.resolve(SCRIPT_DIRECTORY, OUTPUT_DIRECTORY);
+  const logDirectory = path.join(output, 'log');
+  const originalInput = await readFile(input, 'utf8');
+  const data = JSON.parse(originalInput.replace(/^\uFEFF/, ''));
   if (!Array.isArray(data.posts)) throw new Error('JSON 根对象必须包含 posts 数组');
-  const previousReport = await readLatestReport(output, input);
-  if (retryFailed && (!previousReport || !Array.isArray(previousReport.failures)
-    || path.resolve(previousReport.input ?? '') !== input)) {
-    throw new Error('--retry-failed 需要输出目录中存在同一输入文件的下载报告（download-report_*.json 或旧版 download-report.json）');
+  const checkpointName = `download-checkpoint_${createHash('sha256').update(input).digest('hex').slice(0, 20)}.json`;
+  const checkpointPath = path.join(logDirectory, checkpointName);
+  const checkpoint = await readJsonIfExists(checkpointPath)
+    ?? await readJsonIfExists(path.join(output, '日志', checkpointName))
+    ?? await readJsonIfExists(path.join(output, checkpointName));
+  if (checkpoint?.input === input && Array.isArray(checkpoint.downloads)) {
+    const saved = new Map(checkpoint.downloads.map(item => [jobKey(item), item.download]));
+    for (const post of data.posts) {
+      for (const [mediaIndex, media] of (post?.media ?? []).entries()) {
+        const key = jobKey({ postId: post.id ?? null, mediaIndex: mediaIndex + 1,
+          type: media.type, url: media.type === 'photo' ? media.url : media.videoUrl });
+        const record = saved.get(key);
+        if (record && (!media.download || (record.updatedAt ?? '') > (media.download.updatedAt ?? ''))) {
+          media.download = record;
+        }
+      }
+    }
+  }
+  const reports = await readDownloadReports(output);
+  const previousReport = reports.find(report =>
+    typeof report?.input === 'string' && path.resolve(report.input) === input);
+  const hasMarkedFailures = data.posts.some(post => post?.media?.some(media =>
+    media?.download?.status === 'failed' && media.download.url === (media.type === 'photo' ? media.url : media.videoUrl)));
+  if (retryFailed && !hasMarkedFailures && !previousReport) {
+    throw new Error('--retry-failed 需要输入 JSON 中有失败标识，或输出目录中存在同一输入文件的下载报告');
   }
   const failedKeys = new Set((previousReport?.failures ?? []).map(jobKey));
-  const statePath = path.join(output, 'download-state.json');
-  const savedState = await readJsonIfExists(statePath);
+  const statePath = path.join(logDirectory, 'download-state.json');
+  const legacyState = await readJsonIfExists(path.join(output, 'download-state.json'));
+  const savedState = await readJsonIfExists(statePath)
+    ?? await readJsonIfExists(path.join(output, '日志', 'download-state.json'));
   const state = savedState?.version === 1 && savedState.files && typeof savedState.files === 'object'
     ? savedState : { version: 1, files: {} };
-  let saveQueue = Promise.resolve();
-  const saveState = () => {
-    saveQueue = saveQueue.then(() => writeJsonAtomic(statePath, state));
-    return saveQueue;
+  if (legacyState?.version === 1 && legacyState.files && typeof legacyState.files === 'object') {
+    state.files = { ...legacyState.files, ...state.files };
+  }
+  const historyByUrl = new Map();
+  const addHistory = record => {
+    if (!record || typeof record.url !== 'string' || !safeMediaFilename(record.filename)) return;
+    if (!historyByUrl.has(record.url)) historyByUrl.set(record.url, []);
+    historyByUrl.get(record.url).push(record);
   };
-  const selection = await selectMediaType();
+  for (const [filename, record] of Object.entries(state.files)) addHistory({ ...record, filename });
+  for (const report of reports) {
+    const records = Array.isArray(report.results) ? report.results : report.currentResults;
+    if (!Array.isArray(records)) continue;
+    for (const record of records) {
+      if (['success', 'skipped', 'downloaded'].includes(record?.status)) addHistory(record);
+    }
+  }
+  const queueStateSave = createSaveQueue();
+  const saveState = () => queueStateSave(() => writeJsonAtomic(statePath, state));
+  const selection = await selectMediaType(inputLines);
   const jobs = [];
+  const mediaByJob = new Map();
+  const usedFilenames = new Set();
   let ignored = 0;
   let filtered = 0;
   for (const [postIndex, post] of data.posts.entries()) {
@@ -124,17 +198,30 @@ async function main() {
       const candidateExt = parsed ? path.extname(parsed.pathname) : '';
       const extension = /^\.[a-z0-9]{1,5}$/i.test(candidateExt)
         ? candidateExt : media.type === 'photo' ? '.jpg' : '.mp4';
-      const postId = String(post.id ?? postIndex + 1).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40);
-      const authorName = filenamePart(post.author?.name, '', 32)
-        || filenamePart(post.author?.handle, '未知作者', 32);
-      const postName = filenamePart(post.name, '', 48)
-        || filenamePart(typeof post.text === 'string' ? post.text.replace(/https?:\/\/\S+/gi, '') : '', '无标题', 48);
-      // 包含帖子序号，防止重复帖子或不可信 ID 造成覆盖、路径穿越。
-      const filename = `${authorName}_${postName}_${postId}_${postIndex + 1}_${mediaIndex + 1}_${media.type}${extension}`;
+      const postedDate = formatPostedDate(post.postedAt);
+      const authorName = filenamePart(post.author?.name, '', AUTHOR_NAME_MAX_LENGTH)
+        || filenamePart(post.author?.handle, '未知作者', AUTHOR_NAME_MAX_LENGTH);
+      const postName = filenamePart(post.name, '', POST_NAME_MAX_LENGTH)
+        || filenamePart(typeof post.text === 'string' ? post.text.replace(/https?:\/\/\S+/gi, '') : '', '无标题', POST_NAME_MAX_LENGTH);
+      // 保留媒体序号，防止同一帖子的多张图片重名。
+      let filename = path.join(media.type === 'photo' ? 'photo' : 'video',
+        `${authorName}_${postName}_${postedDate}_${mediaIndex + 1}_${media.type}${extension}`);
+      // 同作者、同标题、同时间的不同帖子可能重名，按需追加短标识。
+      const baseFilename = filename;
+      let collision = 0;
+      while (usedFilenames.has(filename) || (state.files[filename] && state.files[filename].url !== url)) {
+        const suffix = createHash('sha256').update(JSON.stringify([url, post.id, postIndex, mediaIndex, collision++])).digest('hex').slice(0, 10);
+        filename = `${baseFilename.slice(0, -extension.length)}_${suffix}${extension}`;
+      }
+      usedFilenames.add(filename);
       const job = { postId: post.id ?? null, mediaIndex: mediaIndex + 1, type: media.type,
         url: typeof url === 'string' ? url : null, filename, ...(error ? { error } : {}) };
-      if (retryFailed && !failedKeys.has(jobKey(job))) { filtered++; continue; }
+      const marked = media.download;
+      const failed = marked?.url === job.url
+        ? marked.status === 'failed' : failedKeys.has(jobKey(job));
+      if (retryFailed && !failed) { filtered++; continue; }
       jobs.push(job);
+      mediaByJob.set(job, media);
     }
   }
   console.log(`帖子 ${data.posts.length} 条，待下载 ${jobs.length} 个（照片 ${jobs.filter(j => j.type === 'photo').length}，视频 ${jobs.filter(j => j.type === 'video').length}），忽略其他类型 ${ignored} 个。`);
@@ -144,28 +231,84 @@ async function main() {
     return;
   }
   if (!jobs.length) { console.log('没有符合条件的文件，无需下载；保留原报告。'); return; }
-  await mkdir(output, { recursive: true });
-  const progress = createProgress(jobs);
-  progress.start();
-  // 先查询大小；不支持 HEAD 的服务器会在实际下载时再次尝试读取大小。
-  let probeIndex = 0;
-  await Promise.all(Array.from({ length: Math.min(4, jobs.length) }, async () => {
-    while (probeIndex < jobs.length) {
-      const job = jobs[probeIndex++];
-      if (!job.error) {
-        try {
-          const response = await fetch(job.url, {
-            method: 'HEAD', signal: AbortSignal.timeout(15_000),
-            headers: { 'Accept-Encoding': 'identity' },
-          });
-          if (response.ok) progress.setSize(job, response);
-          await response.body?.cancel();
-        } catch { /* 大小未知不影响下载。 */ }
+  const existingByJob = new Map();
+  let checkIndex = 0;
+  console.log('正在对比本地下载记录…');
+  await Promise.all(Array.from({ length: Math.min(DOWNLOAD_CONCURRENCY, jobs.length) }, async () => {
+    while (checkIndex < jobs.length) {
+      const job = jobs[checkIndex++];
+      if (job.error) continue;
+      const marked = mediaByJob.get(job).download;
+      const candidates = [...(historyByUrl.get(job.url) ?? [])];
+      if (marked?.status === 'downloaded' && marked.output === output
+        && safeMediaFilename(marked.filename)) candidates.unshift(marked);
+      for (const record of candidates) {
+        let existing;
+        try { existing = await verifyExisting({ ...job, filename: record.filename }, output, record, null); }
+        catch (error) {
+          console.warn(`历史文件暂时无法校验：${record.filename}（${describeError(error)}）`);
+          continue;
+        }
+        if (!existing) continue;
+        job.filename = record.filename;
+        existingByJob.set(job, existing);
+        break;
       }
-      progress.probed++;
     }
   }));
-  progress.phase = '下载中';
+  const pending = jobs.filter(job => !existingByJob.has(job));
+  console.log(`符合条件 ${jobs.length} 个，已下载可跳过 ${existingByJob.size} 个，待下载 ${pending.length} 个。`);
+  const count = pending.length ? await selectDownloadCount(inputLines, pending.length) : 0;
+  const deferred = pending.length - count;
+  const selected = new Set(pending.slice(0, count));
+  const chosen = jobs.filter(job => existingByJob.has(job) || selected.has(job));
+  jobs.splice(0, jobs.length, ...chosen);
+  console.log(`本次下载 ${count} 个，跳过已下载 ${existingByJob.size} 个，其余 ${deferred} 个留待下次。`);
+  // 首次更新前备份；串行、原子替换，避免并发下载交叉写入 JSON。
+  try { await writeFile(`${input}.before-download.bak`, originalInput, { encoding: 'utf8', flag: 'wx' }); }
+  catch (error) { if (error.code !== 'EEXIST') throw error; }
+  await Promise.all(['photo', 'video', 'log'].map(name => mkdir(path.join(output, name), { recursive: true })));
+  const queueInputSave = createSaveQueue();
+  let inputLocked = false;
+  const saveInput = (retryOriginal = false) => queueInputSave(async () => {
+    const downloads = [];
+    for (const post of data.posts) {
+      for (const [mediaIndex, media] of (post?.media ?? []).entries()) {
+        if (!media.download) continue;
+        downloads.push({ postId: post.id ?? null, mediaIndex: mediaIndex + 1, type: media.type,
+          url: media.type === 'photo' ? media.url : media.videoUrl, download: media.download });
+      }
+    }
+    // Checkpoint in the output directory remains usable even when the source is locked.
+    await writeJsonAtomic(checkpointPath, { input, downloads });
+    if (inputLocked && !retryOriginal) return;
+    try {
+      await writeJsonAtomic(input, data);
+      inputLocked = false;
+    } catch (error) {
+      if (!['EPERM', 'EBUSY', 'EACCES'].includes(error.code)) throw error;
+      if (!inputLocked) console.warn(`原 JSON 暂时无法更新，继续下载；状态已保存在：${checkpointPath}`);
+      inputLocked = true;
+    }
+  });
+  for (const post of data.posts) {
+    for (const media of post?.media ?? []) {
+      if (!['photo', 'video'].includes(media?.type)) continue;
+      const url = media.type === 'photo' ? media.url : media.videoUrl;
+      if (!media.download || media.download.url !== url) {
+        media.download = { status: 'pending', url: url ?? null };
+      }
+    }
+  }
+  await saveInput();
+  const progress = createProgress(jobs);
+  // 已下载项只使用本地校验结果；未选中的项已从 jobs 排除。
+  // 新文件在 GET 响应中读取大小，不再等待额外的 HEAD 请求。
+  for (const job of jobs) {
+    const existing = existingByJob.get(job);
+    if (existing) progress.restore(job, existing.bytes);
+  }
+  progress.start();
   const results = new Array(jobs.length);
   let next = 0;
   let completed = 0;
@@ -175,10 +318,16 @@ async function main() {
       const job = jobs[index];
       try {
         if (job.error) throw new Error(job.error);
-        const record = state.files[job.filename];
-        const existing = await verifyExisting(job, output, record, progress.size(job));
+        const marked = mediaByJob.get(job).download;
+        const record = state.files[job.filename]
+          ?? (marked?.status === 'downloaded' && marked.filename === job.filename
+            && marked.output === output ? marked : null);
+        const existing = existingByJob.get(job)
+          ?? await verifyExisting(job, output, record, progress.size(job));
         if (existing) {
           progress.restore(job, existing.bytes);
+          state.files[job.filename] = { url: job.url, ...existing };
+          await saveState();
           results[index] = { ...job, status: 'skipped', ...existing };
         } else {
           const verified = await download(job, output, progress);
@@ -189,6 +338,16 @@ async function main() {
       } catch (error) {
         results[index] = { ...job, status: 'failed', error: describeError(error) };
       }
+      const result = results[index];
+      mediaByJob.get(job).download = {
+        status: result.status === 'failed' ? 'failed' : 'downloaded',
+        url: job.url, output, filename: job.filename, updatedAt: new Date().toISOString(),
+        ...(result.status === 'failed' ? { error: result.error } : {
+          bytes: result.bytes, sha256: result.sha256, sizeVerified: result.sizeVerified,
+        }),
+      };
+      // 原 JSON 被占用时使用输出目录检查点；检查点也无法保存时才报错。
+      await saveInput();
       completed++;
       progress.completed = completed;
       if (results[index].status === 'failed') progress.failed++;
@@ -197,7 +356,10 @@ async function main() {
     }
   }
   try {
-    await Promise.all(Array.from({ length: Math.min(4, jobs.length) }, worker));
+    const workers = await Promise.allSettled(Array.from({ length: Math.min(DOWNLOAD_CONCURRENCY, jobs.length) }, worker));
+    const rejected = workers.find(result => result.status === 'rejected');
+    if (rejected) throw rejected.reason;
+    await saveInput(true);
   } finally {
     progress.stop();
   }
@@ -213,12 +375,13 @@ async function main() {
   const report = { input, output, finishedAt: new Date().toISOString(), total: jobs.length,
     succeeded: results.filter(result => result.status === 'success').length,
     skipped, failed: currentFailures.length, pendingFailed: failures.length,
-    ignored, selection, filtered, retryFailed, failures, results: [...merged.values()], currentResults: results };
-  const reportPath = path.join(output, reportFilename());
+    ignored, selection, filtered, deferred, requested: count, retryFailed, failures, results: [...merged.values()], currentResults: results };
+  const reportPath = path.join(logDirectory, reportFilename());
   await writeFile(reportPath, JSON.stringify(report, null, 2), { encoding: 'utf8', flag: 'wx' });
   console.log(`\n下载完成：新下载成功 ${report.succeeded} 个，已验证跳过 ${skipped} 个，本次失败 ${report.failed} 个。待重试失败共 ${failures.length} 个。`);
   for (const item of failures) console.log(`失败：${item.filename}\n  地址：${item.url ?? '缺失'}\n  原因：${item.error}`);
   console.log(`完整报告：${reportPath}`);
+  if (inputLocked) console.warn(`原 JSON 仍被占用；完整状态保留在 ${checkpointPath}，下次运行会自动读取。`);
   if (currentFailures.length) process.exitCode = 1;
 }
 
@@ -228,40 +391,50 @@ function jobKey(job) {
 
 function reportFilename(now = new Date()) {
   const parts = Object.fromEntries(new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+    timeZone: REPORT_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
   }).formatToParts(now).map(part => [part.type, part.value]));
   const stamp = `${parts.year}${parts.month}${parts.day}_${parts.hour}${parts.minute}${parts.second}_${String(now.getUTCMilliseconds()).padStart(3, '0')}`;
   return `download-report_${stamp}_${randomUUID()}.json`;
 }
 
-async function readLatestReport(output, input) {
-  let entries;
-  try { entries = await readdir(output, { withFileTypes: true }); }
-  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
-  const candidates = await Promise.all(entries
-    .filter(entry => entry.isFile() && /^download-report(?:_[\w-]+)?\.json$/.test(entry.name))
-    .map(async entry => {
-      const filename = path.join(output, entry.name);
-      return { filename, modified: (await stat(filename)).mtimeMs };
-    }));
+function safeMediaFilename(filename) {
+  if (typeof filename !== 'string') return false;
+  const parts = filename.split(/[\\/]/);
+  const basename = parts.at(-1);
+  return parts.length <= 2 && (parts.length === 1 || ['photo', 'video', '图片', '视频'].includes(parts[0]))
+    && !!basename && !basename.includes(':') && basename !== '.' && basename !== '..';
+}
+
+async function readDownloadReports(output) {
+  const candidates = (await Promise.all([output, path.join(output, 'log'), path.join(output, '日志')].map(async directory => {
+    let entries;
+    try { entries = await readdir(directory, { withFileTypes: true }); }
+    catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+    return Promise.all(entries
+      .filter(entry => entry.isFile() && /^download-report(?:_[\w-]+)?\.json$/.test(entry.name))
+      .map(async entry => {
+        const filename = path.join(directory, entry.name);
+        return { filename, modified: (await stat(filename)).mtimeMs };
+      }));
+  }))).flat();
   candidates.sort((a, b) => b.modified - a.modified || b.filename.localeCompare(a.filename));
+  const reports = [];
   for (const candidate of candidates) {
-    const report = await readJsonIfExists(candidate.filename);
-    if (typeof report?.input === 'string' && path.resolve(report.input) === input) return report;
+    try {
+      const report = await readJsonIfExists(candidate.filename);
+      if (report && typeof report === 'object') reports.push(report);
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      console.warn(`忽略无法解析的历史报告：${candidate.filename}`);
+    }
   }
-  return null;
+  return reports;
 }
 
 async function readJsonIfExists(filename) {
   try { return JSON.parse(await readFile(filename, 'utf8')); }
   catch (error) { if (error.code === 'ENOENT') return null; throw error; }
-}
-
-async function writeJsonAtomic(filename, value) {
-  const temporary = `${filename}.tmp`;
-  await writeFile(temporary, JSON.stringify(value, null, 2), 'utf8');
-  await rename(temporary, filename);
 }
 
 async function verifyExisting(job, output, record, expectedSize) {
@@ -284,12 +457,12 @@ function responseSize(response) {
   return Number.isSafeInteger(size) && size >= 0 && (!encoding || encoding === 'identity') ? size : null;
 }
 
-async function selectMediaType() {
+async function selectMediaType(lines) {
   console.log('\n请选择下载类型：\n  1. 仅图片\n  2. 仅视频\n  3. 图片和视频');
-  const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
-  try {
     process.stdout.write('请输入 1、2 或 3，然后回车：');
-    for await (const line of input) {
+    while (true) {
+      const { value: line, done } = await lines.next();
+      if (done) throw new Error('未选择下载类型，已取消下载');
       const choice = { '1': 'photo', '2': 'video', '3': 'all' }[line.trim()];
       if (choice) {
         console.log(`已选择：${choice === 'photo' ? '仅图片' : choice === 'video' ? '仅视频' : '图片和视频'}。`);
@@ -297,10 +470,29 @@ async function selectMediaType() {
       }
       process.stdout.write('输入无效，请输入 1、2 或 3：');
     }
-    throw new Error('未选择下载类型，已取消下载');
-  } finally {
-    input.close();
+}
+
+async function selectDownloadCount(lines, total) {
+  process.stdout.write(`请输入本次下载数量（1-${total}，输入 0 下载全部）：`);
+  while (true) {
+    const { value, done } = await lines.next();
+    if (done) throw new Error('未选择下载数量，已取消下载');
+    const text = value.trim();
+    const count = /^\d+$/.test(text) ? Number(text) : NaN;
+    if (Number.isSafeInteger(count) && count >= 0 && count <= total) return count === 0 ? total : count;
+    process.stdout.write(`输入无效，请输入 1-${total} 的整数，或输入 0 下载全部：`);
   }
+}
+
+function formatPostedDate(value) {
+  if (typeof value !== 'string' || !value.trim()) return '未知日期';
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return '未知日期';
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-GB', {
+    timeZone: POST_DATE_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+  }).formatToParts(date).map(part => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day}_${parts.hour}${parts.minute}${parts.second}`;
 }
 
 function filenamePart(value, fallback, maxLength) {
@@ -328,11 +520,11 @@ function describeError(error) {
 async function download(job, output, progress) {
   const destination = path.join(output, job.filename);
   const temporary = `${destination}.part`;
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= DOWNLOAD_MAX_ATTEMPTS; attempt++) {
     try {
       progress.reset(job);
       // 超时覆盖连接和完整文件传输；失败最多尝试三次。
-      const signal = AbortSignal.timeout(300_000);
+      const signal = AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS);
       const response = await fetch(job.url, { signal, headers: { 'Accept-Encoding': 'identity' } });
       if (!response.ok) {
         await response.body?.cancel();
@@ -374,8 +566,8 @@ async function download(job, output, progress) {
     } catch (error) {
       progress.reset(job);
       await rm(temporary, { force: true });
-      if (attempt === 3) throw error;
-      await new Promise(resolve => setTimeout(resolve, attempt * 1000));
+      if (attempt === DOWNLOAD_MAX_ATTEMPTS) throw error;
+      await new Promise(resolve => setTimeout(resolve, attempt * DOWNLOAD_RETRY_DELAY_MS));
     }
   }
 }
@@ -399,7 +591,7 @@ function createProgress(jobs) {
     if (process.stdout.isTTY) { cursorTo(process.stdout, 0); clearLine(process.stdout, 0); }
   }
   const progress = {
-    phase: '查询大小', probed: 0, completed: 0, failed: 0,
+    phase: '下载中', completed: 0, failed: 0,
     setSize(job, response) {
       states.get(job).size = responseSize(response);
     },
@@ -415,7 +607,7 @@ function createProgress(jobs) {
       previousTime = now;
       previousBytes = transferred;
       // 重定向到文件或日志时每五秒输出一次，避免刷屏。
-      if (!process.stdout.isTTY && !force && ++ticks % 10 !== 0) return;
+      if (!process.stdout.isTTY && !force && ++ticks % LOG_PROGRESS_EVERY_TICKS !== 0) return;
       let downloaded = 0, total = 0, remaining = 0, unknown = 0;
       for (const state of states.values()) {
         downloaded += state.bytes;
@@ -427,13 +619,12 @@ function createProgress(jobs) {
       const percent = !unknown && total > 0 ? ` ${(downloaded / total * 100).toFixed(1)}%` : '';
       const eta = !unknown && speed > 0 && !progress.failed
         ? `${Math.ceil(remaining / speed)} 秒` : '未知';
-      const phase = progress.phase === '查询大小' ? `查询大小 ${progress.probed}/${jobs.length}` : progress.phase;
-      const line = `${phase} | 完成 ${progress.completed}/${jobs.length}（失败 ${progress.failed}） | 已下载 ${formatBytes(downloaded)} | 总大小 ${sizeText} | 剩余 ${remainingText}${percent} | 速度 ${formatBytes(speed)}/s | 预计剩余 ${eta}`;
+      const line = `${progress.phase} | 完成 ${progress.completed}/${jobs.length}（失败 ${progress.failed}） | 已下载 ${formatBytes(downloaded)} | 总大小 ${sizeText} | 剩余 ${remainingText}${percent} | 速度 ${formatBytes(speed)}/s | 预计剩余 ${eta}`;
       erase();
       process.stdout.write(line + (process.stdout.isTTY ? '' : '\n'));
     },
     log(message) { erase(); console.log(message); },
-    start() { progress.render(true); timer = setInterval(() => progress.render(), 500); },
+    start() { progress.render(true); timer = setInterval(() => progress.render(), PROGRESS_REFRESH_MS); },
     stop() {
       clearInterval(timer);
       progress.phase = '下载结束';
