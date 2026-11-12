@@ -81,6 +81,10 @@ log/download-report_年月日_时分秒_毫秒_唯一标识.json，使用北京�
 
 ## 5.1 运行方式
 
+`download-media.mjs` 下载结束并保存报告后，会自动执行同目录的 `organize-media.mjs`，无需额外命令。仅部分文件下载失败时，仍会整理已经下载的文件，并保留失败退出状态。没有待下载项时也会整理；预览、取消输入或流程异常中止时不整理。
+
+脚本顶部 `AUTO_ORGANIZE = true` 控制此行为，设为 `false` 可关闭。自动调用时会传入下载脚本的实际输出目录，因此修改 `OUTPUT_DIRECTORY` 后也会整理对应目录。整理失败会输出错误并返回失败状态，已保存的下载报告不受影响。
+
 `organize-media.mjs` 位于 `xDownload` 文件夹，默认整理该文件夹下的 `XD`，不受当前命令行目录影响。在 `XD` 目录中执行：
 
 ```powershell

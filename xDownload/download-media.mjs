@@ -3,6 +3,8 @@
 // ## 1. 输出与网络
 // 下载根目录：相对路径基于脚本所在文件夹；也可填写绝对路径。
 const OUTPUT_DIRECTORY = 'XD';
+// 下载和报告保存完成后自动整理文件；设为 false 可关闭（--dry-run 始终不整理）。
+const AUTO_ORGANIZE = true;
 // 默认 HTTP(S) 代理地址；空字符串 '' 关闭自动代理，--proxy 可临时覆盖。
 const PROXY_URL = 'http://127.0.0.1:7890';
 // 同时处理的文件数：正整数，过大会增加网络、磁盘和服务器压力。
@@ -230,7 +232,11 @@ async function run(inputLines) {
     console.log(`仅检查数据，没有访问任何链接。无效地址 ${jobs.filter(j => j.error).length} 个。`);
     return;
   }
-  if (!jobs.length) { console.log('没有符合条件的文件，无需下载；保留原报告。'); return; }
+  if (!jobs.length) {
+    console.log('没有符合条件的文件，无需下载；保留原报告。');
+    organizeAfterDownload(output);
+    return;
+  }
   const existingByJob = new Map();
   // 整理脚本可能移动文件；按实际位置建立索引，仍须通过大小和哈希校验。
   const localFiles = await indexLocalMedia(output);
@@ -386,6 +392,21 @@ async function run(inputLines) {
   console.log(`完整报告：${reportPath}`);
   if (inputLocked) console.warn(`原 JSON 仍被占用；完整状态保留在 ${checkpointPath}，下次运行会自动读取。`);
   if (currentFailures.length) process.exitCode = 1;
+  organizeAfterDownload(output);
+}
+
+function organizeAfterDownload(output) {
+  if (!AUTO_ORGANIZE || dryRun) return;
+  console.log('\n开始自动整理下载文件…');
+  const result = spawnSync(process.execPath, [path.join(SCRIPT_DIRECTORY, 'organize-media.mjs'), '--output', output], {
+    stdio: 'inherit',
+  });
+  if (result.error || result.status !== 0) {
+    console.error(`自动整理失败：${result.error?.message ?? `整理脚本退出码 ${result.status ?? result.signal}`}。下载报告已保留，可稍后单独运行整理脚本。`);
+    process.exitCode = 1;
+  } else {
+    console.log('自动整理完成。');
+  }
 }
 
 function jobKey(job) {

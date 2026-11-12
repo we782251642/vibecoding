@@ -37,6 +37,7 @@ test('persists media status, verifies skipped files, and retries failures withou
   try {
     const source = await readFile(new URL('./download-media.mjs', import.meta.url), 'utf8');
     const script = path.join(root, 'download-media.mjs');
+    await writeFile(path.join(root, 'organize-media.mjs'), await readFile(new URL('./organize-media.mjs', import.meta.url)));
     await writeFile(script, source.replace("const PROXY_URL = 'http://127.0.0.1:7890';", "const PROXY_URL = '';").replace(
       'const io = { writeFile, rename, rm, delay, ...operations };',
       `const io = { writeFile, rename, rm, delay, ...operations };
@@ -64,7 +65,9 @@ test('persists media status, verifies skipped files, and retries failures withou
       child.stdin.end(answers);
     });
     const media = async () => JSON.parse(await readFile(input, 'utf8')).posts[0].media;
-    assert.equal((await run(['--dry-run'])).code, 0);
+    const preview = await run(['--dry-run']);
+    assert.equal(preview.code, 0);
+    assert.doesNotMatch(preview.log, /开始自动整理/);
     assert.equal(await readFile(input, 'utf8'), original);
     assert.deepEqual(gets, { good: 0, bad: 0 });
     const cancelled = await run([], {}, '1\n');
@@ -74,6 +77,7 @@ test('persists media status, verifies skipped files, and retries failures withou
     assert.deepEqual(gets, { good: 0, bad: 0 });
     const limited = await run([], {}, '1\n2.5\n3\n-1\n\n1\n');
     assert.equal(limited.code, 0, limited.log);
+    assert.match(limited.log, /自动整理完成/);
     assert.match(limited.log, /输入无效/);
     assert.match(limited.log, /本次下载 1 个/);
     assert.deepEqual(gets, { good: 1, bad: 0 });
@@ -82,6 +86,7 @@ test('persists media status, verifies skipped files, and retries failures withou
     assert.equal((await media())[1].download.status, 'pending');
     const first = await run();
     assert.equal(first.code, 1, first.log);
+    assert.match(first.log, /自动整理完成/, 'individual download failures must not prevent organizing completed files');
     let items = await media();
     assert.equal(items[0].download.status, 'downloaded');
     assert.match(path.basename(items[0].download.filename), /^test_无标题_2026-10-22_110908_1_photo\.jpg$/);
@@ -204,6 +209,11 @@ test('persists media status, verifies skipped files, and retries failures withou
     assert.equal((await readdir(path.join(output, 'video'))).length, 1);
     assert.equal((await readFile(path.join(output, videoItem.download.filename), 'utf8')), 'fixture-bad');
     assert.equal(headRequests, 0, 'size must come from GET headers, never a separate HEAD request');
+    await rename(path.join(root, 'organize-media.mjs'), path.join(root, 'organize-media.disabled'));
+    const failedOrganize = await run([], {}, '2\n');
+    assert.equal(failedOrganize.code, 1);
+    assert.match(failedOrganize.log, /自动整理失败/);
+    assert.match(failedOrganize.log, /完整报告/);
   } finally {
     await new Promise(resolve => server.close(resolve));
     await rm(root, { recursive: true, force: true });

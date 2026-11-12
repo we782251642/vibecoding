@@ -11,10 +11,15 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 
-const output = path.resolve(path.dirname(fileURLToPath(import.meta.url)), OUTPUT_DIRECTORY);
-const dryRun = process.argv.slice(2).includes('--dry-run');
-if (process.argv.slice(2).some(arg => arg !== '--dry-run')) {
-  console.error('用法：node organize-media.mjs [--dry-run]');
+const args = process.argv.slice(2);
+const outputIndex = args.indexOf('--output');
+const explicitOutput = outputIndex === -1 ? null : args[outputIndex + 1];
+if (outputIndex !== -1 && explicitOutput && !explicitOutput.startsWith('--')) args.splice(outputIndex, 2);
+const output = explicitOutput
+  ? path.resolve(explicitOutput) : path.resolve(path.dirname(fileURLToPath(import.meta.url)), OUTPUT_DIRECTORY);
+const dryRun = args.includes('--dry-run');
+if (args.some(arg => arg !== '--dry-run')) {
+  console.error('用法：node organize-media.mjs [--dry-run] [--output 输出目录]');
   process.exitCode = 1;
 } else {
   main().catch(error => { console.error(`整理失败：${error.message}`); process.exitCode = 1; });
