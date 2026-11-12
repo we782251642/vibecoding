@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, writeFile, readdir, rm, rename } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, readdir, rm, rename, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -164,6 +164,18 @@ test('persists media status, verifies skipped files, and retries failures withou
     assert.equal(gets.good, goodBefore);
     assert.equal(gets.bad, badBefore + 1);
     assert.equal((await media())[1].download.status, 'downloaded');
+
+    // A moved file must be found in numbered folders without HEAD/GET requests.
+    const beforeGrouped = requests;
+    for (const item of await media()) {
+      const grouped = path.join('photo', '1', path.basename(item.download.filename));
+      await mkdir(path.join(output, 'photo', '1'), { recursive: true });
+      await rename(path.join(output, item.download.filename), path.join(output, grouped));
+    }
+    const groupedRun = await run();
+    assert.equal(groupedRun.code, 0, groupedRun.log);
+    assert.equal(requests, beforeGrouped);
+    for (const item of await media()) assert.equal(path.dirname(item.download.filename), path.join('photo', '1'));
 
     // Legacy root-level reports and files still prevent duplicate downloads.
     const legacyItems = await media();

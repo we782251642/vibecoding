@@ -232,6 +232,8 @@ async function run(inputLines) {
   }
   if (!jobs.length) { console.log('没有符合条件的文件，无需下载；保留原报告。'); return; }
   const existingByJob = new Map();
+  // 整理脚本可能移动文件；按实际位置建立索引，仍须通过大小和哈希校验。
+  const localFiles = await indexLocalMedia(output);
   let checkIndex = 0;
   console.log('正在对比本地下载记录…');
   await Promise.all(Array.from({ length: Math.min(DOWNLOAD_CONCURRENCY, jobs.length) }, async () => {
@@ -244,13 +246,13 @@ async function run(inputLines) {
         && safeMediaFilename(marked.filename)) candidates.unshift(marked);
       for (const record of candidates) {
         let existing;
-        try { existing = await verifyExisting({ ...job, filename: record.filename }, output, record, null); }
+        try { existing = await verifyExisting({ ...job, filename: record.filename }, output, record, null, localFiles); }
         catch (error) {
           console.warn(`历史文件暂时无法校验：${record.filename}（${describeError(error)}）`);
           continue;
         }
         if (!existing) continue;
-        job.filename = record.filename;
+        job.filename = existing.filename;
         existingByJob.set(job, existing);
         break;
       }
@@ -323,8 +325,9 @@ async function run(inputLines) {
           ?? (marked?.status === 'downloaded' && marked.filename === job.filename
             && marked.output === output ? marked : null);
         const existing = existingByJob.get(job)
-          ?? await verifyExisting(job, output, record, progress.size(job));
+          ?? await verifyExisting(job, output, record, progress.size(job), localFiles);
         if (existing) {
+          job.filename = existing.filename;
           progress.restore(job, existing.bytes);
           state.files[job.filename] = { url: job.url, ...existing };
           await saveState();
@@ -402,7 +405,8 @@ function safeMediaFilename(filename) {
   if (typeof filename !== 'string') return false;
   const parts = filename.split(/[\\/]/);
   const basename = parts.at(-1);
-  return parts.length <= 2 && (parts.length === 1 || ['photo', 'video', '图片', '视频'].includes(parts[0]))
+  return parts.length <= 3 && (parts.length === 1 || ['photo', 'video', '图片', '视频'].includes(parts[0]))
+    && (parts.length < 3 || /^[1-9]\d*$/.test(parts[1]))
     && !!basename && !basename.includes(':') && basename !== '.' && basename !== '..';
 }
 
@@ -437,17 +441,43 @@ async function readJsonIfExists(filename) {
   catch (error) { if (error.code === 'ENOENT') return null; throw error; }
 }
 
-async function verifyExisting(job, output, record, expectedSize) {
+async function indexLocalMedia(output) {
+  const index = new Map();
+  async function scan(relative = '') {
+    let entries;
+    try { entries = await readdir(path.join(output, relative), { withFileTypes: true }); }
+    catch (error) { if (error.code === 'ENOENT') return; throw error; }
+    for (const entry of entries) {
+      const filename = path.join(relative, entry.name);
+      if (entry.isFile() && safeMediaFilename(filename)) {
+        if (!index.has(entry.name)) index.set(entry.name, []);
+        index.get(entry.name).push(filename);
+      } else if (entry.isDirectory() && ((!relative && ['photo', 'video', '图片', '视频'].includes(entry.name))
+        || (relative && !relative.includes(path.sep) && /^[1-9]\d*$/.test(entry.name)))) {
+        await scan(filename);
+      }
+    }
+  }
+  await scan();
+  return index;
+}
+
+async function verifyExisting(job, output, record, expectedSize, localFiles = new Map()) {
   if (!record || record.url !== job.url || !record.sha256 || !(record.bytes > 0)) return null;
-  const filename = path.join(output, job.filename);
+  if (!safeMediaFilename(job.filename)) return null;
+  const candidates = new Set([job.filename, ...(localFiles.get(path.basename(job.filename)) ?? [])]);
+  for (const relative of candidates) {
+  const filename = path.join(output, relative);
   try {
     const info = await stat(filename);
-    if (!info.isFile() || info.size !== record.bytes || (expectedSize !== null && info.size !== expectedSize)) return null;
+    if (!info.isFile() || info.size !== record.bytes || (expectedSize !== null && info.size !== expectedSize)) continue;
     const hash = createHash('sha256');
     for await (const chunk of createReadStream(filename)) hash.update(chunk);
-    if (hash.digest('hex') !== record.sha256) return null;
-    return { bytes: record.bytes, sha256: record.sha256, sizeVerified: expectedSize !== null || record.sizeVerified === true };
-  } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+    if (hash.digest('hex') !== record.sha256) continue;
+    return { filename: relative, bytes: record.bytes, sha256: record.sha256, sizeVerified: expectedSize !== null || record.sizeVerified === true };
+  } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  return null;
 }
 
 function responseSize(response) {
