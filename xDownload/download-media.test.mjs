@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, writeFile, readdir, rm, rename, mkdir } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, readdir, rm, rename, mkdir, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -202,11 +202,19 @@ test('persists media status, verifies skipped files, and retries failures withou
     await writeFile(input, JSON.stringify({ posts: [{ id: '2', media: [{
       type: 'video', videoUrl: `${url}/video.mp4`,
     }] }] }));
+    // Fill the last group: a new download must go directly into the next group.
+    await mkdir(path.join(output, 'video', '1'), { recursive: true });
+    for (let index = 0; index < 100; index++) {
+      const filename = path.join(output, 'video', '1', `old-${index}.mp4`);
+      await writeFile(filename, 'older-video');
+      await utimes(filename, 1000, 1000);
+    }
     const video = await run([], {}, '2\n0\n');
     assert.equal(video.code, 0, video.log);
     const videoItem = (await media())[0];
-    assert.equal(path.dirname(videoItem.download.filename), 'video');
-    assert.equal((await readdir(path.join(output, 'video'))).length, 1);
+    assert.equal(path.dirname(videoItem.download.filename), path.join('video', '2'));
+    assert.equal((await readdir(path.join(output, 'video', '1'))).length, 100);
+    assert.equal((await readdir(path.join(output, 'video', '2'))).length, 1);
     assert.equal((await readFile(path.join(output, videoItem.download.filename), 'utf8')), 'fixture-bad');
     assert.equal(headRequests, 0, 'size must come from GET headers, never a separate HEAD request');
     await rename(path.join(root, 'organize-media.mjs'), path.join(root, 'organize-media.disabled'));

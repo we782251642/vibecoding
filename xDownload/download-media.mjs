@@ -5,6 +5,8 @@
 const OUTPUT_DIRECTORY = 'XD';
 // 下载和报告保存完成后自动整理文件；设为 false 可关闭（--dry-run 始终不整理）。
 const AUTO_ORGANIZE = true;
+// 已分组时每个目录的文件上限，应与 organize-media.mjs 的 FILES_PER_FOLDER 保持一致。
+const FILES_PER_FOLDER = 100;
 // 默认 HTTP(S) 代理地址；空字符串 '' 关闭自动代理，--proxy 可临时覆盖。
 const PROXY_URL = 'http://127.0.0.1:7890';
 // 同时处理的文件数：正整数，过大会增加网络、磁盘和服务器压力。
@@ -276,6 +278,7 @@ async function run(inputLines) {
   try { await writeFile(`${input}.before-download.bak`, originalInput, { encoding: 'utf8', flag: 'wx' }); }
   catch (error) { if (error.code !== 'EEXIST') throw error; }
   await Promise.all(['photo', 'video', 'log'].map(name => mkdir(path.join(output, name), { recursive: true })));
+  await assignTailFolders(output, jobs.filter(job => !existingByJob.has(job)));
   const queueInputSave = createSaveQueue();
   let inputLocked = false;
   const saveInput = (retryOriginal = false) => queueInputSave(async () => {
@@ -393,6 +396,39 @@ async function run(inputLines) {
   if (inputLocked) console.warn(`原 JSON 仍被占用；完整状态保留在 ${checkpointPath}，下次运行会自动读取。`);
   if (currentFailures.length) process.exitCode = 1;
   organizeAfterDownload(output);
+}
+
+async function assignTailFolders(output, jobs) {
+  for (const type of ['photo', 'video']) {
+    const directory = path.join(output, type);
+    const groups = (await readdir(directory, { withFileTypes: true }))
+      .filter(entry => entry.isDirectory() && /^[1-9]\d*$/.test(entry.name))
+      .map(entry => Number(entry.name));
+    // 尚未分组时仍放根目录，结束后超过上限会自动分组。
+    if (!groups.length) continue;
+    let group = Math.max(...groups);
+    let entries = await readdir(path.join(directory, String(group)), { withFileTypes: true });
+    let count = entries.filter(entry => entry.isFile() && !/\.(part|tmp)$/i.test(entry.name)).length;
+    const reserved = new Set();
+    for (const job of jobs.filter(item => item.type === type)) {
+      if (count >= FILES_PER_FOLDER) { group++; count = 0; }
+      const targetDirectory = path.join(directory, String(group));
+      await mkdir(targetDirectory, { recursive: true });
+      let basename = path.basename(job.filename);
+      const extension = path.extname(basename);
+      let relative = path.join(type, String(group), basename);
+      while (reserved.has(relative) || await stat(path.join(output, relative)).then(() => true, error => {
+        if (error.code === 'ENOENT') return false;
+        throw error;
+      })) {
+        basename = `${path.basename(job.filename, extension)}_${randomUUID().slice(0, 8)}${extension}`;
+        relative = path.join(type, String(group), basename);
+      }
+      reserved.add(relative);
+      job.filename = relative;
+      count++;
+    }
+  }
 }
 
 function organizeAfterDownload(output) {

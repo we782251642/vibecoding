@@ -3,8 +3,7 @@
 const OUTPUT_DIRECTORY = 'XD';
 // 每个编号目录最多放置的文件数，必须为正整数。
 const FILES_PER_FOLDER = 100;
-// 文件名中发表时间对应的时区偏移；应与下载脚本的 POST_DATE_TIME_ZONE 一致。
-const POST_DATE_OFFSET = '+08:00';
+// 按文件修改时间（下载写入完成时间）正序排列，不使用帖子发表日期。
 
 import { readdir, stat, mkdir, rename, writeFile, rmdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
@@ -51,9 +50,7 @@ async function plan(type) {
       names.add(entry.name.toLowerCase());
       const source = path.join(relative, entry.name);
       const info = await stat(path.join(directory, source));
-      const match = entry.name.match(/_(\d{4}-\d{2}-\d{2})_(\d{2})(\d{2})(\d{2})_\d+_(?:photo|video)(?:_[a-f\d]+)?\.[^.]+$/i);
-      const posted = match ? Date.parse(`${match[1]}T${match[2]}:${match[3]}:${match[4]}${POST_DATE_OFFSET}`) : NaN;
-      files.push({ source, name: entry.name, time: Number.isFinite(posted) ? posted : info.mtimeMs });
+      files.push({ source, name: entry.name, time: info.mtimeMs });
     }
   }
   await collect('', entries);

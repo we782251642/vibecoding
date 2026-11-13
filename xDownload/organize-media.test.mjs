@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -19,6 +19,8 @@ test('sorts into groups of 100, preserves data, previews, and rebalances new fil
     }
     await Promise.all(Array.from({ length: 201 }, (_, index) => writeFile(path.join(photo, filename(index, 'photo')), `photo-${index}`)));
     await Promise.all(Array.from({ length: 100 }, (_, index) => writeFile(path.join(video, filename(index, 'video')), `video-${index}`)));
+    // Explicit write times make ordering deterministic even with parallel fixture creation.
+    for (let index = 0; index < 201; index++) await utimes(path.join(photo, filename(index, 'photo')), 1000 + index, 1000 + index);
     await writeFile(path.join(photo, 'active.jpg.part'), 'unfinished');
     const run = (...args) => spawnSync(process.execPath, [script, ...args], { cwd: path.join(root, 'XD'), encoding: 'utf8' });
     assert.equal(run('--dry-run').status, 0);
@@ -38,7 +40,7 @@ test('sorts into groups of 100, preserves data, previews, and rebalances new fil
     await writeFile(path.join(photo, earlier), 'earlier');
     result = run();
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(await readFile(path.join(photo, '1', earlier), 'utf8'), 'earlier');
+    assert.equal(await readFile(path.join(photo, '3', earlier), 'utf8'), 'earlier');
     assert.equal((await readdir(path.join(photo, '3'))).length, 2);
     assert.equal(await readFile(path.join(photo, 'active.jpg.part'), 'utf8'), 'unfinished');
     // Duplicate names are rejected before any files are moved.
